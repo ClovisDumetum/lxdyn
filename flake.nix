@@ -156,6 +156,36 @@
         };
       };
 
+      # Deny-list, so a new source directory still builds. None of this reaches zig, and
+      # leaving it in makes a CI or README edit publish a fresh 32 MB xdyn.
+      xdynSource = pkgs.lib.cleanSourceWith {
+        name = "xdyn-source";
+        src = self;
+        filter = path: _type:
+          let rel = pkgs.lib.removePrefix "${self}/" path; in
+          !(pkgs.lib.hasPrefix ".github" rel)
+          && !(pkgs.lib.hasPrefix "doxygen" rel)
+          && !(pkgs.lib.hasSuffix ".md" rel);
+      };
+
+      # Writable homes, and the submodules `src = self` has not got.
+      xdynPrelude = ''
+        export HOME=$TMPDIR/home ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig XDG_CACHE_HOME=$TMPDIR/cache
+        mkdir -p $HOME $ZIG_GLOBAL_CACHE_DIR $XDG_CACHE_HOME
+
+        # -T: a git source materialises each gitlink as an empty dir that plain cp nests inside.
+        # Writable: codegen runs generate_module_header.sh inside external/ssc/ssc.
+        cp -rT ${inputs.src-ssc}         external/ssc
+        cp -rT ${inputs.src-interfaces}  external/interfaces
+        cp -rT ${inputs.src-websocketpp} external/websocketpp
+        cp -rT ${inputs.src-stb}         external/stb
+        chmod -R u+w external
+
+        # SSC's own submodule: the github fetcher stops at SSC's tree and never descends.
+        cp -rT ${inputs.src-f2c} external/ssc/ssc/f2c
+        chmod -R u+w external/ssc/ssc/f2c
+      '';
+
       # ===================================================================================
       # xdyn itself, for consumers that want the binaries rather than a shell — LOTUSim
       # runs xdyn-for-cs as one websocket physics server per vessel.
@@ -170,17 +200,7 @@
         pname = "xdyn";
         version = "26.8.0";
 
-        # Deny-list, so a new source directory still builds. None of this reaches zig, and
-        # leaving it in makes a CI or README edit publish a fresh 32 MB xdyn.
-        src = pkgs.lib.cleanSourceWith {
-          name = "xdyn-source";
-          src = self;
-          filter = path: _type:
-            let rel = pkgs.lib.removePrefix "${self}/" path; in
-            !(pkgs.lib.hasPrefix ".github" rel)
-            && !(pkgs.lib.hasPrefix "doxygen" rel)
-            && !(pkgs.lib.hasSuffix ".md" rel);
-        };
+        src = xdynSource;
 
         # No cmake or ninja: `zig build` invokes neither. The closure is already built.
         nativeBuildInputs = [ pkgs.zig pkgs.llvm pkgs.removeReferencesTo ];
@@ -191,21 +211,7 @@
 
         buildPhase = ''
           runHook preBuild
-          export HOME=$TMPDIR/home ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig XDG_CACHE_HOME=$TMPDIR/cache
-          mkdir -p $HOME $ZIG_GLOBAL_CACHE_DIR $XDG_CACHE_HOME
-
-          # -T: a git source materialises each gitlink as an empty dir that plain cp nests inside.
-          # Writable: codegen runs generate_module_header.sh inside external/ssc/ssc.
-          cp -rT ${inputs.src-ssc}         external/ssc
-          cp -rT ${inputs.src-interfaces}  external/interfaces
-          cp -rT ${inputs.src-websocketpp} external/websocketpp
-          cp -rT ${inputs.src-stb}         external/stb
-          chmod -R u+w external
-
-          # SSC's own submodule: the github fetcher stops at SSC's tree and never descends.
-          cp -rT ${inputs.src-f2c} external/ssc/ssc/f2c
-          chmod -R u+w external/ssc/ssc/f2c
-
+          ${xdynPrelude}
           # -Dgit-sha, because headSha() shells out to git against a .git the sandbox has not
           # got. -Deigen, because the pkg-config probe needs a setup hook this stdenv has not
           # got — eigen is header-only, so it is not a bucket-3 dependency.
@@ -238,8 +244,58 @@
 
         meta.description = "xdyn simulator binaries, libc++, static x86_64-linux-musl";
       };
+
+      # ===================================================================================
+      # The FMU library and make_fmu.py, for consumers that pack their models as FMUs —
+      # LOTUSim loads them in the simulator's process instead of an xdyn-for-cs per vessel.
+      #
+      # x86_64-linux-gnu, not musl: an importer dlopens the library into a glibc process,
+      # and a second, static libc inside it is not something a loader can reconcile.
+      # ===================================================================================
+      xdyn-fmu = pkgs.stdenvNoCC.mkDerivation {
+        pname = "xdyn-fmu";
+        version = "26.8.0";
+        src = xdynSource;
+
+        # makeWrapper and python3 for the xdyn-make-fmu command, which only needs the
+        # standard library.
+        nativeBuildInputs = [ pkgs.zig pkgs.llvm pkgs.removeReferencesTo pkgs.makeWrapper ];
+        buildInputs = [ pkgs.python3 ];
+
+        # The library is already stripped by build.zig, and fixup's patchelf has nothing to
+        # rewrite in a library that zig linked against its own glibc stubs.
+        dontFixup = true;
+
+        buildPhase = ''
+          runHook preBuild
+          ${xdynPrelude}
+          zig build fmu \
+            -Dtarget=x86_64-linux-gnu \
+            -Ddeps=${closures.libcxx-deps-x86_64-linux-gnu} \
+            -Ddeps-host=${hostTools} \
+            -Deigen=${pkgs.eigen_5}/include/eigen3 \
+            -Dgit-sha=${self.rev or self.dirtyRev or "unknown"} \
+            --prefix $TMPDIR/prefix
+          runHook postBuild
+        '';
+
+        installPhase = ''
+          runHook preInstall
+          install -Dm755 $TMPDIR/prefix/fmu/xdyn_fmu.so $out/lib/xdyn_fmu.so
+          install -Dm644 xdyn_wrapper_fmi/make_fmu.py $out/share/xdyn-fmu/make_fmu.py
+          # --library defaults to the one next to it: a later --library still wins.
+          makeWrapper ${pkgs.python3}/bin/python3 $out/bin/xdyn-make-fmu \
+            --add-flags $out/share/xdyn-fmu/make_fmu.py \
+            --add-flags "--library $out/lib/xdyn_fmu.so"
+          # Same as xdyn's: Boost's assert messages keep the closure's store path.
+          remove-references-to -t ${closures.libcxx-deps-x86_64-linux-gnu} $out/lib/xdyn_fmu.so
+          runHook postInstall
+        '';
+
+        meta.description = "xdyn FMI 2.0 FMU library and make_fmu.py, libc++, x86_64-linux-gnu";
+      };
     in {
-      packages.${system} = closures // { inherit xdyn; };
+      packages.${system} = closures // { inherit xdyn xdyn-fmu; };
 
       devShells.${system} = rec {
         # mkShellNoCC, not mkShell: mkShell's cc-wrapper exports CPATH, which zig cc honours --
